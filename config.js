@@ -1,0 +1,1 @@
+window.COCKPIT_WORKER = "";

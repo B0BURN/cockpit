@@ -1,0 +1,72 @@
+name: Deploy
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+concurrency:
+  group: deploy
+  cancel-in-progress: false
+jobs:
+  worker:
+    runs-on: ubuntu-latest
+    outputs:
+      url: ${{ steps.url.outputs.url }}
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Ensure workers.dev subdomain
+        id: sub
+        run: |
+          API=https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/workers/subdomain
+          SUB=$(curl -s -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" $API | jq -r '.result.subdomain // empty')
+          if [ -z "$SUB" ]; then
+            WANT="cockpit-$(echo $GITHUB_REPOSITORY_OWNER | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9-' | cut -c1-30)"
+            curl -s -X PUT -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" -H "Content-Type: application/json" -d "{\"subdomain\":\"$WANT\"}" $API | jq -c '.success,.errors'
+            SUB=$(curl -s -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" $API | jq -r '.result.subdomain // empty')
+          fi
+          [ -n "$SUB" ] || { echo "No workers.dev subdomain: open Workers & Pages in the Cloudflare dashboard once"; exit 1; }
+          echo "sub=$SUB" >> $GITHUB_OUTPUT
+      - name: Deploy worker
+        working-directory: worker
+        run: |
+          npx --yes wrangler@3.114.17 deploy --var GH_OWNER:${{ github.repository_owner }}
+      - name: Set worker secrets
+        working-directory: worker
+        env:
+          APP_PASSWORD: ${{ secrets.APP_PASSWORD }}
+          DATA_TOKEN: ${{ secrets.DATA_TOKEN }}
+          VAPID_PRIVATE_JWK: ${{ secrets.VAPID_PRIVATE_JWK }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          jq -n 'env | {APP_PASSWORD, DATA_TOKEN, VAPID_PRIVATE_JWK, ANTHROPIC_API_KEY} | with_entries(select(.value != null and .value != ""))' > /tmp/secrets.json
+          npx --yes wrangler@3.114.17 secret bulk /tmp/secrets.json
+          rm /tmp/secrets.json
+      - id: url
+        run: echo "url=https://cockpit.${{ steps.sub.outputs.sub }}.workers.dev" >> $GITHUB_OUTPUT
+  pages:
+    needs: worker
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: |
+          echo "window.COCKPIT_WORKER = \"${{ needs.worker.outputs.url }}\";" > app/config.js
+          sed -i "s/__BUILD__/${GITHUB_SHA::8}/" app/sw.js
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: app
+      - id: deploy
+        uses: actions/deploy-pages@v4
