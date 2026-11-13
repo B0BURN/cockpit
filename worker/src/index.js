@@ -1,7 +1,7 @@
 // Semester Cockpit Worker: sync + push notifications + Claude chat.
 // Source of truth: data.json in a private GitHub repo (env.GH_OWNER/env.DATA_REPO), so Claude can also edit it.
 import { sendPush } from "./push.js";
-import { notificationsFor, buildBrief, openTasks, taskDueS, off, ymdS, countdown, recurringSoon } from "../../app/logic.js";
+import { notificationsFor, buildBrief, openTasks, taskDueS, off, ymdS, countdown, recurringSoon, clockS } from "../../app/logic.js";
 
 const CORS = {"Access-Control-Allow-Origin":"*", "Access-Control-Allow-Headers":"authorization,content-type", "Access-Control-Allow-Methods":"GET,POST,OPTIONS", "Access-Control-Max-Age":"86400"};
 const json = (o, status=200) => new Response(JSON.stringify(o), {status, headers:{"content-type":"application/json", ...CORS}});
@@ -174,9 +174,75 @@ async function cron(env, scheduledTime){
   return pushAll(env, msgs);
 }
 
+/* ---------- timer: lock-screen Shortcuts + "timer running" notification ---------- */
+const COURSE_ALIASES = [[/^(tsa|time ?series)$/i,"TSA"],[/^(ml|machine ?learning)$/i,"ML"],[/^(ads|dsa|algo|algorithms?)$/i,"ADS"],
+  [/^(dev|dev ?econ|development)$/i,"DEV"],[/^(mm|math|math ?methods)$/i,"MM"],[/^(rp|capstone|research)$/i,"RP"],[/^(ent|entrepreneurship)$/i,"ENT"]];
+const CAT_SET = ["study","class","work","gym","road","diet","life"];
+const sid = () => Date.now().toString(36) + Math.random().toString(36).slice(2,7);
+const fmtMins = m => { m = Math.round(m); return m < 60 ? m+"m" : Math.floor(m/60)+"h"+(m%60? " "+m%60+"m" : ""); };
+
+// Push messages that mirror a timer change (start → "running since", stop → "logged").
+// tag "timer" makes each new message replace the previous one on the lock screen.
+// prev = the timer doc before this change; repeats (same start) and stale replays are skipped.
+function timerPushes(state, changes, prev){
+  const o = off(state), out = [];
+  for(const c of changes||[]){
+    if(c.c!=="config" || c.i!=="timer" || c.x) continue;
+    if(!(c.u > Date.now() - 10*6e4)) continue; // an offline change synced much later: don't buzz
+    const t = c.d || {};
+    if(t.running && prev?.running && prev.start===t.start) continue; // e.g. distraction counter update
+    if(!t.running && !prev?.running) continue;
+    if(t.running){
+      out.push({tag:"timer", title:`⏱ ${t.title||"Timer"} · since ${clockS(t.start + o)}`, body:"Timer running. Stop it from your lock-screen Shortcut or the app.", url:"./", ttl:12*3600});
+    } else {
+      const s = (changes||[]).find(x => x.c==="sessions" && !x.x && x.d && x.d.end && Math.abs(x.d.end - (c.u||0)) < 5*6e4);
+      out.push({tag:"timer", title: s? `✓ Logged ${fmtMins(s.d.mins)} · ${s.d.title}` : "Timer stopped", body: s? `${clockS(s.d.start + o)}–${clockS(s.d.end + o)}` : "", url:"./", ttl:3600});
+    }
+  }
+  return out;
+}
+
+// /timer?action=start|stop|toggle|status&course=TSA&title=...&cat=study  → plain-text reply for Shortcuts
+async function timerEndpoint(env, params){
+  const action = (params.action || "toggle").toLowerCase(), now = Date.now();
+  const {obj: store} = await readFile(env, "data.json", EMPTY());
+  const state = toState(store), cur = state.timer, o = off(state);
+  const running = !!cur?.running;
+  if(action==="status") return {text: running? `${cur.title} · ${fmtMins((now-cur.start)/6e4)} (since ${clockS(cur.start+o)})` : "No timer running", changes:[]};
+
+  const changes = [];
+  const stop = () => {
+    if(!running) return null;
+    const mins = (now - cur.start)/6e4;
+    changes.push({c:"config", i:"timer", d:{running:false}, u:now});
+    if(mins >= 1){
+      const d = {taskId:cur.taskId||null, title:cur.title, cat:cur.cat, course:cur.course||null, start:cur.start, end:now, mins:Math.round(mins*10)/10, distractions:cur.distractions||0};
+      changes.push({c:"sessions", i:sid(), d, u:now});
+    }
+    return mins;
+  };
+
+  if(action==="stop" || (action==="toggle" && running)){
+    const mins = stop();
+    return {prev: cur, text: mins==null? "No timer running" : mins < 1? "Stopped (under a minute, not logged)" : `Logged ${fmtMins(mins)} of ${cur.title}`, changes};
+  }
+  if(action!=="start" && action!=="toggle") return {text:"Unknown action. Use start, stop, toggle or status.", changes:[], status:400};
+
+  // start (stops and logs any running timer first)
+  let course = null;
+  const raw = String(params.course||"").trim();
+  if(raw){ course = state.courses[raw.toUpperCase()]? raw.toUpperCase() : (COURSE_ALIASES.find(([re]) => re.test(raw))||[])[1] || null; }
+  const cat = CAT_SET.includes(String(params.cat||"").toLowerCase())? params.cat.toLowerCase() : course? "study" : "life";
+  const title = String(params.title||"").trim().slice(0,120) || (course? (state.courses[course]?.short || course)+" study" : cat[0].toUpperCase()+cat.slice(1));
+  const prev = stop();
+  // timer doc must be written after the stop above, so give it a later timestamp
+  changes.push({c:"config", i:"timer", d:{running:true, start:now, distractions:0, target:0, title, cat, course, taskId:null}, u:now+1});
+  return {prev: cur, text: `Started ${title} at ${clockS(now+o)}` + (prev!=null && prev>=1? ` · logged ${fmtMins(prev)} of ${cur.title}` : ""), changes};
+}
+
 /* ---------- HTTP ---------- */
 export default {
-  async fetch(req, env){
+  async fetch(req, env, ctx){
     if(req.method==="OPTIONS") return new Response(null, {headers:CORS});
     const url = new URL(req.url);
     if(url.pathname==="/health") return json({ok:true});
@@ -184,11 +250,24 @@ export default {
     try{
       if(url.pathname==="/vapid") return json({key: env.VAPID_PUBLIC, chat: !!env.ANTHROPIC_API_KEY});
       const body = req.method==="POST"? await req.json().catch(() => ({})) : {};
+      if(url.pathname==="/timer"){
+        const params = {...Object.fromEntries(url.searchParams), ...body};
+        const r = await timerEndpoint(env, params);
+        if(r.changes.length){
+          const store = await update(env, "data.json", EMPTY(), s => mergeChanges(s, r.changes), "Timer (Shortcut)");
+          ctx.waitUntil(pushAll(env, timerPushes(toState(store), r.changes, r.prev)).catch(() => {}));
+        }
+        return new Response(r.text, {status: r.status||200, headers:{"content-type":"text/plain; charset=utf-8", ...CORS}});
+      }
       if(url.pathname==="/sync"){
         const changes = body.changes || [];
+        let prevTimer = null;
         const store = changes.length
-          ? await update(env, "data.json", EMPTY(), s => mergeChanges(s, changes), "App sync")
+          ? await update(env, "data.json", EMPTY(), s => { prevTimer = s.docs["config/timer"]?.d || null; return mergeChanges(s, changes); }, "App sync")
           : (await readFile(env, "data.json", EMPTY())).obj;
+        // timer started/stopped in the app → mirror it on the lock screen (only if this change actually won)
+        const tc = changes.filter(c => c && c.c==="config" && c.i==="timer" && store.docs["config/timer"]?.u===c.u);
+        if(tc.length) ctx.waitUntil(pushAll(env, timerPushes(toState(store), [...tc, ...changes.filter(c => c && c.c==="sessions")], prevTimer)).catch(() => {}));
         return json({docs: store.docs, ts: Date.now()});
       }
       if(url.pathname==="/subscribe"){
